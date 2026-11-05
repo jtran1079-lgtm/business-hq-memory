@@ -1,0 +1,58 @@
+# Watchdog: meldet per GitHub-Issue (→ Push-Nachricht in der GitHub-App), wenn der Scout
+# fehlschlägt oder zu lange keinen Erfolg hatte. Läuft bei GitHub – funktioniert auch, wenn der Server ausfällt.
+name: scout-watchdog
+on:
+  push:
+    paths: [STATUS.md]
+  schedule:
+    - cron: "0 9 * * *"
+  workflow_dispatch:
+permissions:
+  contents: read
+  issues: write
+concurrency: scout-watchdog
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: STATUS.md
+          sparse-checkout-cone-mode: false
+      - name: STATUS.md prüfen
+        id: eval
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import re, datetime as dt, pathlib
+          p = pathlib.Path("STATUS.md")
+          if not p.exists():
+              print("alert=STATUS.md fehlt"); raise SystemExit
+          meta = dict(re.findall(r"^(\w+): (.*)$", p.read_text().split("---")[1], re.M))
+          now = dt.datetime.now(dt.timezone.utc)
+          age = lambda k: (now - dt.datetime.fromisoformat(meta[k])).days if meta.get(k, "nie") != "nie" else 999
+          msg = ""
+          if meta.get("last_status") in ("failed", "budget_blocked"):
+              msg = f"Letzter Lauf {meta.get('last_run')}: {meta['last_status']}"
+          elif meta.get("timer") == "active" and age("updated") > 4:
+              msg = f"Seit {age('updated')} Tagen kein Status vom Server"
+          elif meta.get("timer") == "active" and age("last_success") > 4:
+              msg = f"Seit {age('last_success')} Tagen kein erfolgreicher Lauf"
+          print(f"alert={msg}")
+          PY
+      - name: Issue öffnen oder schließen
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ALERT: ${{ steps.eval.outputs.alert }}
+        run: |
+          gh label create scout-alert -R "$GITHUB_REPOSITORY" --color D93F0B 2>/dev/null || true
+          open=$(gh issue list -R "$GITHUB_REPOSITORY" --label scout-alert --state open --json number -q '.[0].number')
+          if [ -n "$ALERT" ]; then
+            if [ -z "$open" ]; then
+              gh issue create -R "$GITHUB_REPOSITORY" --label scout-alert --title "Scout: $ALERT" --body "Details: STATUS.md"
+            else
+              gh issue comment "$open" -R "$GITHUB_REPOSITORY" --body "$ALERT"
+            fi
+          elif [ -n "$open" ]; then
+            gh issue close "$open" -R "$GITHUB_REPOSITORY" --comment "Scout läuft wieder normal."
+          fi
